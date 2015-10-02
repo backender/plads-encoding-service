@@ -17,26 +17,31 @@ import           Network.Wreq
 import           Haskakafka
 import           Haskakafka.InternalRdKafkaEnum
 
-data CampaignInputMessage = CampaignInputMessage { inputId :: Integer,
+import           Database.MySQL.Simple
+
+data CampaignInputMessage = CampaignInputMessage { campaignId :: Integer,
+                                                   inputId :: Integer,
                                                    status :: T.Text,
                                                    thumbnailUrl :: T.Text
                                                  } deriving (Show)
 
-data CreateEncodingResponse = CreateEncodingResponse { jobId :: Maybe Integer,
+data CreateEncodingResponse = CreateEncodingResponse { cid :: Integer,
+                                                       jobId :: Maybe Integer,
                                                        jobStatus :: Maybe T.Text,
                                                        mpdUrl :: Maybe T.Text
                                                      } deriving (Show)
 
 instance FromJSON CampaignInputMessage where
  parseJSON (Object v) =
-    CampaignInputMessage <$> v .: "inputId"
+    CampaignInputMessage <$> v .: "campaignId"
+                         <*> v .: "inputId"
                          <*> v .: "status"
                          <*> v .: "thumbnailUrl"
  parseJSON _ = mzero
 
 instance ToJSON CreateEncodingResponse where
-  toJSON (CreateEncodingResponse (Just jobId) (Just jobStatus) (Just mpdUrl)) =
-      object ["jobId" .= jobId, "jobStatus" .= jobStatus, "mpdUrl" .= mpdUrl]
+    toJSON (CreateEncodingResponse (cid) (Just jobId) (Just jobStatus) (Just mpdUrl)) =
+      object ["campaignId" .= cid, "jobId" .= jobId, "jobStatus" .= jobStatus, "mpdUrl" .= mpdUrl]
 
 api :: String -> String
 --api s = "http://portal.bitcodin.com/api" ++ s --PROD
@@ -60,27 +65,29 @@ handleConsume e = do
                       KafkaResponseError RdKafkaRespErrTimedOut -> return $ Left $ "[INFO] " ++ (show err)
                       _                                         -> return $ Left $ "[ERROR] " ++ (show err)
       (Right m) -> do
-          print $ BL.fromStrict $ messagePayload m
+          --print $ BL.fromStrict $ messagePayload m
           case decodeCIMPayload $ messagePayload m of
             Nothing -> return $ Left $ "[ERROR] decode campaignInput: " ++ (show $ messagePayload m)
             Just m -> return $ Right m
 
-handleResponse :: Response BL.ByteString -> IO (Either String CreateEncodingResponse)
-handleResponse r = do
-    print r
+handleResponse :: Integer -> Response BL.ByteString -> IO (Either String CreateEncodingResponse)
+handleResponse cid r = do
     case code of
         201 -> do
-          print $ jobStatus encodingResponse
-          case fromJust $ jobStatus encodingResponse of
-            "Enqueued" -> return $ Right encodingResponse
-            _ -> return $ Left $ "[ERROR] job status: " ++ show (fromJust $ jobStatus encodingResponse)
+          print $ r ^? responseBody . key "manifestUrls" . key "mpdUrl"
+          case jobStatus encodingResponse of
+            Just s -> case s of
+              "Enqueued" -> return $ Right encodingResponse
+              _ -> return $ Left $ "[ERROR] job status: " ++ show s
+            Nothing -> return $ Left $ "[ERROR] job status could not be determined."
         _ -> return $ Left $ handleErrorResponse code
     where
       code = (r ^. responseStatus . statusCode)
-      rb = \x t -> r ^? responseBody . key x . t
-      encodingResponse = CreateEncodingResponse (rb "jobId" _Integer )
-                                                (rb "status" _String)
-                                                (rb "manifestUrls" _String) --todo
+      rb = \k t -> r ^? responseBody . k . t
+      encodingResponse = CreateEncodingResponse (cid)
+                                                (rb (key "jobId") _Integer )
+                                                (rb (key "status") _String)
+                                                (rb (key "manifestUrls" . key "mpdUrl") _String)
 
 handleErrorResponse :: Int -> String
 handleErrorResponse e = do
@@ -99,6 +106,8 @@ produce message = do
                     $ \kafka topic -> do
   produceMessage topic (KafkaSpecifiedPartition partition) message
 
+--updateMedia conn = execute conn "update media set mpd_url=?, encoding_job=? where id = (select media_id from campaign where id=?)"
+--              ["myhaskellhurl", 1, 20]
 
 main :: IO ()
 main = do
@@ -115,12 +124,19 @@ main = do
     c <- handleConsume =<< consumeMessage topic partition 1000
     case c of
       Right m -> do
-        resp <- handleResponse =<< (createJob $ inputId m)
+        resp <- (handleResponse (campaignId m))=<< (createJob $ inputId m)
         case resp of
           Right input -> do
             prod <- produce $ KafkaProduceMessage $ BL.toStrict $ encode input
             case prod of
-              Nothing -> putStrLn "produced"
+              Nothing -> do
+                putStrLn $ "[INFO] Produced Encoding: " ++ show input
+                --conn <- connect defaultConnectInfo {
+                --                                      connectPassword = "password",
+                --                                      connectDatabase = "plads"
+                --                                   }
+                --u <- updateMedia conn
+                --print u
               Just e -> putStrLn $ show e
           Left e -> putStrLn e
       Left e -> putStrLn e
