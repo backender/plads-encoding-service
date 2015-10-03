@@ -4,6 +4,7 @@ import Control.Lens                                 hiding ( (.=) )
 import Control.Concurrent                           ( threadDelay )
 import Control.Monad
 
+import           Data.Int
 import           Data.Aeson
 import           Data.Aeson.Lens
 import           Data.Maybe
@@ -44,15 +45,18 @@ instance ToJSON CreateEncodingResponse where
       object ["campaignId" .= cid, "jobId" .= jobId, "jobStatus" .= jobStatus, "mpdUrl" .= mpdUrl]
 
 api :: String -> String
---api s = "http://portal.bitcodin.com/api" ++ s --PROD
-api s = "http://private-anon-b5423cd68-bitcodinrestapi.apiary-mock.com/api" ++ s --MOCK
+api s = "http://portal.bitcodin.com/api" ++ s --PROD
+--api s = "http://private-anon-b5423cd68-bitcodinrestapi.apiary-mock.com/api" ++ s --MOCK
 
 opts :: Options
 opts = defaults & header "bitcodin-api-key" .~ ["3d03c4648b4b6170e7ad7986b637ddcd26a6053a49eb2aa25ec01961a4dd3e2d"]
 
 createJob :: Integer -> IO (Response BL.ByteString)
 createJob input = do
-    let payload = encode $ object ["inputId" .= input, "encodingProfile" .= (1 :: Integer)]
+    let payload = encode $ object ["inputId" .= input,
+                                   "encodingProfileId" .= (8867 :: Integer),
+                                   "manifestTypes" .= ["mpd" :: T.Text, "m3u8" :: T.Text] 
+                                  ]
     postWith opts (api "/job/create") payload
 
 decodeCIMPayload :: C8.ByteString -> Maybe CampaignInputMessage
@@ -80,7 +84,7 @@ handleResponse cid r = do
               "Enqueued" -> return $ Right encodingResponse
               _ -> return $ Left $ "[ERROR] job status: " ++ show s
             Nothing -> return $ Left $ "[ERROR] job status could not be determined."
-        _ -> return $ Left $ handleErrorResponse code
+        _ -> return $ Left $ handleErrorResponse code r
     where
       code = (r ^. responseStatus . statusCode)
       rb = \k t -> r ^? responseBody . k . t
@@ -89,10 +93,11 @@ handleResponse cid r = do
                                                 (rb (key "status") _String)
                                                 (rb (key "manifestUrls" . key "mpdUrl") _String)
 
-handleErrorResponse :: Int -> String
-handleErrorResponse e = do
+handleErrorResponse :: Int -> (Response BL.ByteString) -> String
+handleErrorResponse e r = do
   case e of
     404 -> "Not found."
+    _   -> show r
 
 produce :: KafkaProduceMessage -> IO (Maybe KafkaError)
 produce message = do
@@ -106,8 +111,11 @@ produce message = do
                     $ \kafka topic -> do
   produceMessage topic (KafkaSpecifiedPartition partition) message
 
---updateMedia conn = execute conn "update media set mpd_url=?, encoding_job=? where id = (select media_id from campaign where id=?)"
---              ["myhaskellhurl", 1, 20]
+updateMedia :: Connection -> (T.Text, T.Text, T.Text) -> IO Int64
+updateMedia conn (url, jobId, cid) = do
+   let q = "update media set mpd_url=?, encoding_job=? where id = (select media_id from campaign where id=?)" :: Query
+   let str = [url, jobId, cid]
+   execute conn q str
 
 main :: IO ()
 main = do
@@ -126,17 +134,17 @@ main = do
       Right m -> do
         resp <- (handleResponse (campaignId m))=<< (createJob $ inputId m)
         case resp of
-          Right input -> do
-            prod <- produce $ KafkaProduceMessage $ BL.toStrict $ encode input
+          Right enc -> do
+            prod <- produce $ KafkaProduceMessage $ BL.toStrict $ encode enc
             case prod of
               Nothing -> do
-                putStrLn $ "[INFO] Produced Encoding: " ++ show input
-                --conn <- connect defaultConnectInfo {
-                --                                      connectPassword = "password",
-                --                                      connectDatabase = "plads"
-                --                                   }
-                --u <- updateMedia conn
-                --print u
+                putStrLn $ "[INFO] Produced Encoding: " ++ show enc
+                conn <- connect defaultConnectInfo {
+                                                      connectPassword = "password",
+                                                      connectDatabase = "plads"
+                                                   }
+                u <- updateMedia conn (fromJust $ mpdUrl enc, T.pack $ show $ fromJust $ jobId enc, T.pack $ show $ cid enc)
+                print u
               Just e -> putStrLn $ show e
           Left e -> putStrLn e
       Left e -> putStrLn e
