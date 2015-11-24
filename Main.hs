@@ -6,12 +6,15 @@ import Control.Monad
 import qualified Control.Exception                  as E
 
 import           Data.Int
-import           Data.Aeson
+import           Data.Aeson hiding (Result)
 import           Data.Aeson.Lens
 import           Data.Maybe
 import qualified Data.Text                          as T
 import qualified Data.ByteString.Char8              as C8
 import qualified Data.ByteString.Lazy               as BL
+import qualified Data.ByteString                    as BS
+import Data.Binary.Get
+
 
 import           Network.Wreq
 import qualified Network.HTTP.Client                as HT
@@ -20,7 +23,10 @@ import           Haskakafka
 import           Haskakafka.InternalRdKafkaEnum
 
 import           Database.MySQL.Simple
+import           Database.MySQL.Simple.QueryResults
+import           Database.MySQL.Simple.Result
 
+import Database.MySQL.Base.Types (Field(..), Type(..))
 
 
 data CampaignInputMessage = CampaignInputMessage { campaignId :: Integer,
@@ -131,26 +137,23 @@ encodeInputs = do
                       partition
                       KafkaOffsetStored
                       $ \kafka topic -> forever $ do
-    c <- handleConsume =<< consumeMessage topic partition 1000
-    case c of
-      Right m -> do
-        resp <- handleResponse (campaignId m) =<< createJob (inputId m)
-        case resp of
-          Right enc -> do
-            prod <- produce $ KafkaProduceMessage $ BL.toStrict $ encode enc
-            case prod of
-              Nothing -> do
-                putStrLn $ "[INFO] Produced Encoding: " ++ show enc
-                conn <- connect defaultConnectInfo {
-                                                      connectPassword = "password",
-                                                      connectDatabase = "plads"
-                                                   }
-                u <- updateMedia conn (fromJust $ mpdUrl enc, T.pack $ show $ fromJust $ jobId enc, T.pack $ show $ cid enc)
-                print u
-              Just e -> print e
-          Left e -> putStrLn e
-      Left e -> putStrLn e
-
+                        c <- handleConsume =<< consumeMessage topic partition 1000
+                        case c of
+                          Right m -> do
+                            resp <- handleResponse (campaignId m) =<< createJob (inputId m)
+                            case resp of
+                              Right enc -> do
+                                prod <- produce $ KafkaProduceMessage $ BL.toStrict $ encode enc
+                                case prod of
+                                  Nothing -> do
+                                    putStrLn $ "[INFO] Produced Encoding: " ++ show enc
+                                    conn <- getConnection
+                                    u <- updateMedia conn (fromJust $ mpdUrl enc, T.pack $ show $ fromJust $ jobId enc, T.pack $ show $ cid enc)
+                                    print u
+                                  Just e -> print e
+                              Left e -> putStrLn e
+                          Left e -> putStrLn e
+                        threadDelay 1000000
 
 data JobStatus = Created | Enqueued | InProgress | Finished | EncodeError | Transfering | Transfered deriving (Enum, Show, Eq)
 type JobId = Int
@@ -158,11 +161,19 @@ type EncodingJob = (JobId, JobStatus)
 type ResponseError = T.Text
 type JobStatusResponse = Either ResponseError T.Text
 
-findEncodingJobs :: Connection -> IO [EncodingJob]
-findEncodingJobs conn = query conn q [fromEnum Transfering :: Int]
+findJobIdStatus :: Connection -> IO [(Maybe Int, Int)]
+findJobIdStatus conn = E.handle logError (query conn q [fromEnum Transfering :: Int])
                         where q = "select m.encoding_job, m.status from media m where m.status < ?" :: Query
+                              logError (E.SomeException e) = do print ("findjobidstatus: " ++ show e); return []
 
-getJobStatus :: E.Exception e => JobId -> IO (Either e (Response BL.ByteString))
+findEncodingJobs :: Connection -> IO [EncodingJob]
+findEncodingJobs conn = do
+                        js <- findJobIdStatus conn
+                        return $ map toEncodingJob (filterNothing js)
+                        where toEncodingJob (jId, jStatus) = (jId, toEnum jStatus :: JobStatus) :: EncodingJob
+                              filterNothing t = map (\(x, y) -> (fromJust x, y)) (filter (isJust . fst) t)
+
+getJobStatus :: JobId -> IO (Either HT.HttpException (Response BL.ByteString))
 getJobStatus job = do
   putStrLn $ "[INFO] GET: " ++ endpoint
   E.try (getWith opts endpoint)
@@ -203,12 +214,12 @@ updateJob conn job rs = case rs of
              where updateIfStatusNotEquals s = fromMaybe (return ()) (updateJobStatus conn s job)
 
 updateJobStatus :: Connection -> JobStatus -> EncodingJob -> Maybe (IO ())
-updateJobStatus conn status (jobId, jobStatus)
-    | status == jobStatus = Nothing
-    | otherwise = Just $ check =<< E.try (execute conn q [fromEnum jobStatus :: Int, jobId :: Int])
+updateJobStatus conn newStatus (jobId, jobStatus)
+    | newStatus == jobStatus = Nothing
+    | otherwise = Just $ check =<< E.try (execute conn q [fromEnum newStatus :: Int, jobId :: Int])
                   where q = "update media set status=? where encoding_job = ?" :: Query
                         check (Left (E.SomeException e)) = putStrLn $ "[ERROR] Updating status (" ++ show jobStatus ++ ") not successfull for job with id " ++ show jobId ++ ": " ++ show e
-                        check (Right r) = putStrLn $ "[Info] Job with id " ++ show jobId ++ show "update to: " ++ show jobStatus
+                        check (Right r) = putStrLn $ "[Info] Job with id " ++ show jobId ++ show "update to: " ++ show newStatus
 
 handleJobs :: Connection -> IO ()
 handleJobs conn = mapM_ (\(jobId, jobStatus) -> updateJob conn (jobId, jobStatus)
@@ -224,8 +235,8 @@ getConnection = connect defaultConnectInfo {  connectHost = "127.0.0.1",
 main :: IO ()
 main = do
   conn <- getConnection
-  -- _ <- forkIO encodeInputs
-  forever $ do
+  _ <- forkIO encodeInputs
+  _ <- forever $ do
     handleJobs conn
     threadDelay 1000000
   putStrLn "running"
