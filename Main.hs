@@ -12,8 +12,6 @@ import           Data.Maybe
 import qualified Data.Text                          as T
 import qualified Data.ByteString.Char8              as C8
 import qualified Data.ByteString.Lazy               as BL
-import qualified Data.ByteString                    as BS
-import Data.Binary.Get
 
 
 import           Network.Wreq
@@ -23,39 +21,52 @@ import           Haskakafka
 import           Haskakafka.InternalRdKafkaEnum
 
 import           Database.MySQL.Simple
-import           Database.MySQL.Simple.QueryResults
-import           Database.MySQL.Simple.Result
 
-import Database.MySQL.Base.Types (Field(..), Type(..))
+data MediaStatus = Uploaded
+                 | InputCreated
+                 | InputError
+                 | EncodeCreated
+                 | EncodeEnqueued
+                 | EncodeInProgress
+                 | EncodeFinished
+                 | EncodeError
+                 | Transfering
+                 | Transfered
+                 | TransferError
+                 deriving (Enum, Show, Eq)
 
+data MediaInputMessage = MediaInputMessage { miMediaId :: Integer,
+                                             miInputId :: Integer,
+                                             miStatus :: T.Text,
+                                             miThumbnailUrl :: T.Text
+                                           } deriving (Show)
 
-data CampaignInputMessage = CampaignInputMessage { campaignId :: Integer,
-                                                   inputId :: Integer,
-                                                   status :: T.Text,
-                                                   thumbnailUrl :: T.Text
-                                                 } deriving (Show)
-
-data CreateEncodingResponse = CreateEncodingResponse { cid :: Integer,
-                                                       jobId :: Maybe Integer,
-                                                       jobStatus :: Maybe T.Text,
-                                                       mpdUrl :: Maybe T.Text
+data CreateEncodingResponse = CreateEncodingResponse { erMediaId :: Integer,
+                                                       erJobId :: Maybe Integer,
+                                                       erJobStatus :: Maybe T.Text,
+                                                       erMpdUrl :: Maybe T.Text
                                                      } deriving (Show)
 
-instance FromJSON CampaignInputMessage where
+instance FromJSON MediaInputMessage where
  parseJSON (Object v) =
-    CampaignInputMessage <$> v .: "campaignId"
-                         <*> v .: "inputId"
-                         <*> v .: "status"
-                         <*> v .: "thumbnailUrl"
+    MediaInputMessage <$> v .: "mediaId"
+                      <*> v .: "inputId"
+                      <*> v .: "status"
+                      <*> v .: "thumbnailUrl"
  parseJSON _ = mzero
 
 instance ToJSON CreateEncodingResponse where
     toJSON (CreateEncodingResponse cid (Just jobId) (Just jobStatus) (Just mpdUrl)) =
-      object ["campaignId" .= cid, "jobId" .= jobId, "jobStatus" .= jobStatus, "mpdUrl" .= mpdUrl]
+      object ["mediaId" .= cid, "jobId" .= jobId, "jobStatus" .= jobStatus, "mpdUrl" .= mpdUrl]
+
+getConnection :: IO Connection
+getConnection = connect defaultConnectInfo {  connectHost = "127.0.0.1",
+                                              connectPassword = "password",
+                                              connectDatabase = "plads" }
 
 api :: String -> String
 api s = "http://portal.bitcodin.com/api" ++ s --PROD
---api s = "http://private-anon-b5423cd68-bitcodinrestapi.apiary-mock.com/api" ++ s --MOCK
+--api s = "https://private-anon-d220f1902-bitcodinrestapi.apiary-mock.com/api" ++ s --MOCK
 
 opts :: Options
 opts = defaults & header "bitcodin-api-key" .~ ["3d03c4648b4b6170e7ad7986b637ddcd26a6053a49eb2aa25ec01961a4dd3e2d"]
@@ -68,10 +79,10 @@ createJob input = postWith opts (api "/job/create") payload
                                   ]
 
 
-decodeCIMPayload :: C8.ByteString -> Maybe CampaignInputMessage
+decodeCIMPayload :: C8.ByteString -> Maybe MediaInputMessage
 decodeCIMPayload p = decode $ BL.fromStrict p
 
-handleConsume :: Either KafkaError KafkaMessage -> IO (Either String CampaignInputMessage)
+handleConsume :: Either KafkaError KafkaMessage -> IO (Either String MediaInputMessage)
 handleConsume e =
     case e of
       (Left err) -> case err of
@@ -80,7 +91,7 @@ handleConsume e =
       (Right m) ->
           --print $ BL.fromStrict $ messagePayload m
           case decodeCIMPayload $ messagePayload m of
-            Nothing -> return $ Left $ "[ERROR] decode campaignInput: " ++ (show $ messagePayload m)
+            Nothing -> return $ Left $ "[ERROR] decode campaignInput: " ++ show (messagePayload m)
             Just m -> return $ Right m
 
 handleResponse :: Integer -> Response BL.ByteString -> IO (Either String CreateEncodingResponse)
@@ -88,7 +99,7 @@ handleResponse cid r =
     case code of
         201 -> do
           print $ r ^? responseBody . key "manifestUrls" . key "mpdUrl"
-          case jobStatus encodingResponse of
+          case erJobStatus encodingResponse of
             Just s -> case s of
               "Enqueued" -> return $ Right encodingResponse
               _ -> return $ Left $ "[ERROR] job status: " ++ show s
@@ -108,28 +119,18 @@ handleErrorResponse e r =
     404 -> "(404, Not found) " ++ show r
     _   -> show r
 
-produce :: KafkaProduceMessage -> IO (Maybe KafkaError)
-produce message = do
-  let partition = 0
-      host = "localhost:9092"
-      topic = "campaignEncoding"
-      kafkaConfig = []
-      topicConfig = []
-  withKafkaProducer kafkaConfig topicConfig
-                    host topic
-                    $ \kafka topic -> produceMessage topic (KafkaSpecifiedPartition partition) message
-
 updateMedia :: Connection -> (T.Text, T.Text, T.Text) -> IO Int64
-updateMedia conn (url, jobId, cid) = do
-   let q = "update media set mpd_url=?, encoding_job=? where id = (select media_id from campaign where id=?)" :: Query
-   let str = [url, jobId, cid]
-   execute conn q str
+updateMedia conn (url, jobId, mediaId) = execute conn q args
+   where q = "update media set status=?, mpd_url=?, encoding_job=? where id=?" :: Query --TODO: handle exception
+         args = [T.pack $ show $ fromEnum EncodeCreated, url, jobId, mediaId]
+
 
 encodeInputs :: IO ()
 encodeInputs = do
+    conn <- getConnection
     let partition = 0
         host = "localhost:9092"
-        topic = "campaignInput"
+        topic = "mediaInput"
         kafkaConfig = []
         topicConfig = []
     withKafkaConsumer kafkaConfig topicConfig
@@ -139,38 +140,32 @@ encodeInputs = do
                       $ \kafka topic -> forever $ do
                         c <- handleConsume =<< consumeMessage topic partition 1000
                         case c of
-                          Right m -> do
-                            resp <- handleResponse (campaignId m) =<< createJob (inputId m)
+                          Right mediaInput -> do
+                            resp <- handleResponse (miMediaId mediaInput) =<< createJob (miInputId mediaInput)
                             case resp of
-                              Right enc -> do
-                                prod <- produce $ KafkaProduceMessage $ BL.toStrict $ encode enc
-                                case prod of
-                                  Nothing -> do
-                                    putStrLn $ "[INFO] Produced Encoding: " ++ show enc
-                                    conn <- getConnection
-                                    u <- updateMedia conn (fromJust $ mpdUrl enc, T.pack $ show $ fromJust $ jobId enc, T.pack $ show $ cid enc)
-                                    print u
-                                  Just e -> print e
+                              Right encodeResponse -> do
+                                u <- updateMedia conn (fromJust $ erMpdUrl encodeResponse, T.pack $ show $ fromJust $ erJobId encodeResponse, T.pack $ show $ erMediaId encodeResponse)
+                                print $ "[INFO] Produced Encoding: " ++ show u
                               Left e -> putStrLn e
                           Left e -> putStrLn e
                         threadDelay 1000000
 
-data JobStatus = Created | Enqueued | InProgress | Finished | EncodeError | Transfering | Transfered deriving (Enum, Show, Eq)
 type JobId = Int
-type EncodingJob = (JobId, JobStatus)
+type EncodingJob = (JobId, MediaStatus)
 type ResponseError = T.Text
 type JobStatusResponse = Either ResponseError T.Text
 
 findJobIdStatus :: Connection -> IO [(Maybe Int, Int)]
-findJobIdStatus conn = E.handle logError (query conn q [fromEnum Transfering :: Int])
-                        where q = "select m.encoding_job, m.status from media m where m.status < ?" :: Query
+findJobIdStatus conn = E.handle logError (query conn q args)
+                        where q = "select m.encoding_job, m.status from media m where m.status > ? AND m.status < ?" :: Query
+                              args = [fromEnum InputCreated :: Int, fromEnum EncodeFinished :: Int]
                               logError (E.SomeException e) = do print ("findjobidstatus: " ++ show e); return []
 
 findEncodingJobs :: Connection -> IO [EncodingJob]
 findEncodingJobs conn = do
                         js <- findJobIdStatus conn
                         return $ map toEncodingJob (filterNothing js)
-                        where toEncodingJob (jId, jStatus) = (jId, toEnum jStatus :: JobStatus) :: EncodingJob
+                        where toEncodingJob (jId, jStatus) = (jId, toEnum jStatus :: MediaStatus) :: EncodingJob
                               filterNothing t = map (\(x, y) -> (fromJust x, y)) (filter (isJust . fst) t)
 
 getJobStatus :: JobId -> IO (Either HT.HttpException (Response BL.ByteString))
@@ -196,47 +191,56 @@ handleStatusResponse (Right r) =
     rb k t = r ^? responseBody . k . t
     jobStatus = rb (key "status") _String
 
-startTransfer :: IO ()
-startTransfer = putStrLn "Transfer started"
-
-updateJob :: Connection -> EncodingJob -> JobStatusResponse -> IO ()
-updateJob conn job rs = case rs of
+updateJobProgress :: Connection -> EncodingJob -> JobStatusResponse -> IO ()
+updateJobProgress conn job rs = case rs of
   Left e -> putStrLn $ "[ERROR] " ++ show e
   Right s -> case s of
-                "Created" -> updateIfStatusNotEquals Created
-                "Enqueued" -> updateIfStatusNotEquals Enqueued
-                "In Progress" -> updateIfStatusNotEquals InProgress
-                "Finished" -> do
-                                updateIfStatusNotEquals Finished
-                                startTransfer
+                "Created" -> updateIfStatusNotEquals EncodeCreated
+                "Enqueued" -> updateIfStatusNotEquals EncodeEnqueued
+                "In Progress" -> updateIfStatusNotEquals EncodeInProgress
+                "Finished" -> do updateIfStatusNotEquals EncodeFinished
+                                 startTransfer $ fst job
                 "Error" -> updateIfStatusNotEquals EncodeError
                 _ -> print $ "[ERROR] Unexpected job status for job " ++ show (fst job) ++ ": " ++ show s
-             where updateIfStatusNotEquals s = fromMaybe (return ()) (updateJobStatus conn s job)
+             where updateIfStatusNotEquals s = fromMaybe sameStatusMessage (updateJobStatus conn s job)
+                   sameStatusMessage = putStrLn $ "Job: " ++ show (fst job) ++ "still in status: " ++ show s
 
-updateJobStatus :: Connection -> JobStatus -> EncodingJob -> Maybe (IO ())
+updateJobStatus :: Connection -> MediaStatus -> EncodingJob -> Maybe (IO ())
 updateJobStatus conn newStatus (jobId, jobStatus)
     | newStatus == jobStatus = Nothing
     | otherwise = Just $ check =<< E.try (execute conn q [fromEnum newStatus :: Int, jobId :: Int])
                   where q = "update media set status=? where encoding_job = ?" :: Query
                         check (Left (E.SomeException e)) = putStrLn $ "[ERROR] Updating status (" ++ show jobStatus ++ ") not successfull for job with id " ++ show jobId ++ ": " ++ show e
-                        check (Right r) = putStrLn $ "[Info] Job with id " ++ show jobId ++ show "update to: " ++ show newStatus
+                        check (Right r) = putStrLn $ "[Info] Job with id " ++ show jobId ++ show " has new Status: " ++ show newStatus
 
-handleJobs :: Connection -> IO ()
-handleJobs conn = mapM_ (\(jobId, jobStatus) -> updateJob conn (jobId, jobStatus)
-                                        . handleStatusResponse
-                                        =<< getJobStatus jobId
+startTransfer :: JobId -> IO ()
+startTransfer job = do
+  p <- produce "mediaTransfer" (KafkaProduceMessage $ BL.toStrict $ encode job)
+  case p of
+    Just e -> putStrLn $ "[ERROR] Job " ++ show job ++ " could not be initialized for Transfer."
+    Nothing -> putStrLn $ "[INFO] Job " ++ show job ++ " initialized for Transfer."
+
+produce :: String -> KafkaProduceMessage -> IO (Maybe KafkaError)
+produce t message = do
+  let partition = 0
+      host = "localhost:9092"
+      topic = t
+      kafkaConfig = []
+      topicConfig = []
+  withKafkaProducer kafkaConfig topicConfig
+                    host topic
+                    $ \kafka topic -> produceMessage topic (KafkaSpecifiedPartition partition) message
+
+monitorJobs :: Connection -> IO ()
+monitorJobs conn = mapM_ (\(jobId, jobStatus) ->
+                            updateJobProgress conn (jobId, jobStatus) . handleStatusResponse =<< getJobStatus jobId
                         ) =<< findEncodingJobs conn
-
-getConnection :: IO Connection
-getConnection = connect defaultConnectInfo {  connectHost = "127.0.0.1",
-                                              connectPassword = "password",
-                                              connectDatabase = "plads" }
 
 main :: IO ()
 main = do
   conn <- getConnection
   _ <- forkIO encodeInputs
   _ <- forever $ do
-    handleJobs conn
+    monitorJobs conn
     threadDelay 1000000
   putStrLn "running"
